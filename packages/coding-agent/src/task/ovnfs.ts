@@ -73,13 +73,42 @@ function checkoutName(agentId: string): string {
 	return `omp-${stem || "task"}-${suffix}`;
 }
 
-/** Remove a checkout; one already gone counts as removed. */
-async function removeCheckout(command: string, checkout: string): Promise<void> {
-	try {
-		await call(command, "rm", { checkout });
-	} catch (err) {
-		if (!(err instanceof OvnfsError && err.code === "not_found")) throw err;
+// ponytail: per-process only; cross-process limits need daemon-side admission.
+let removalQueue: Promise<void> = Promise.resolve();
+
+/** Let Linux memory pressure subside, but never hold a removal for more than 60 seconds. */
+async function waitForMemoryPressure(): Promise<void> {
+	if (process.platform !== "linux") return;
+	const configured = Number(process.env.OMP_OVNFS_RM_PSI_MAX ?? 10);
+	const threshold = Number.isFinite(configured) && configured >= 0 ? configured : 10;
+	const deadline = Date.now() + 60_000;
+	for (let waited = 0; waited < 60; waited++) {
+		let pressure: string;
+		try {
+			pressure = await fs.readFile("/proc/pressure/memory", "utf8");
+		} catch {
+			return;
+		}
+		const match = /^some\s+avg10=(\d+(?:\.\d+)?)\s/m.exec(pressure);
+		if (!match || Number(match[1]) < threshold) return;
+		const remaining = deadline - Date.now();
+		if (remaining <= 0) return;
+		await Bun.sleep(Math.min(1000, remaining));
 	}
+}
+
+/** Remove a checkout; one already gone counts as removed. */
+function removeCheckout(command: string, checkout: string): Promise<void> {
+	const removal = removalQueue.then(async () => {
+		await waitForMemoryPressure();
+		try {
+			await call(command, "rm", { checkout });
+		} catch (err) {
+			if (!(err instanceof OvnfsError && err.code === "not_found")) throw err;
+		}
+	});
+	removalQueue = removal.catch(() => {});
+	return removal;
 }
 
 /**
